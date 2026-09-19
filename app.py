@@ -153,13 +153,19 @@ def overview(competition: str = "ALL"):
         COALESCE(SUM(home_goals+away_goals),0) goals
         FROM matches WHERE 1=1 {w}''', p) or {}
     sanc = row(f'''SELECT
-        SUM(CASE WHEN sanction_type='2min' THEN 1 ELSE 0 END) two_min,
-        SUM(CASE WHEN sanction_type IN ('disqualification','disqualification_3x2') THEN 1 ELSE 0 END) dq,
-        SUM(CASE WHEN person_type='team_official' THEN 1 ELSE 0 END) bench
-        FROM sanctions s JOIN matches m ON m.id=s.match_id WHERE s.is_derived=0 {w}''', p) or {}
+        COALESCE(SUM(CASE WHEN sanction_type='2min' AND s.is_derived=0 THEN 1 ELSE 0 END),0) two_min,
+        COALESCE(SUM(CASE WHEN sanction_type='disqualification' AND s.is_derived=0 THEN 1 ELSE 0 END),0) direct_dq,
+        COALESCE(SUM(CASE WHEN sanction_type='disqualification_3x2' THEN 1 ELSE 0 END),0) dq_3x2,
+        COALESCE(SUM(CASE WHEN person_type='team_official' AND s.is_derived=0 THEN 1 ELSE 0 END),0) bench
+        FROM sanctions s JOIN matches m ON m.id=s.match_id WHERE 1=1 {w}''', p) or {}
+    pens = row(f'''SELECT
+        COALESCE(SUM(COALESCE(home_7m_attempts,0)+COALESCE(away_7m_attempts,0)),0) seven_attempts,
+        COALESCE(SUM(COALESCE(home_7m_scored,0)+COALESCE(away_7m_scored,0)),0) seven_scored
+        FROM matches WHERE status='played' {w}''', p) or {}
+    sanc["dq"] = int(sanc.get("direct_dq") or 0) + int(sanc.get("dq_3x2") or 0)
     issues = row("SELECT COUNT(*) n FROM data_issues WHERE resolved=0") or {"n":0}
     last = row("SELECT * FROM sync_runs ORDER BY id DESC LIMIT 1")
-    return {**totals, **sanc, "issues":issues.get("n",0), "last_sync":last}
+    return {**totals, **sanc, **pens, "issues":issues.get("n",0), "last_sync":last}
 
 
 @app.get("/api/matches")
@@ -187,25 +193,57 @@ def matches(competition: str="ALL", round_no: int|None=None):
     return data
 
 
+@app.get("/api/match/{match_id}")
+def match_detail(match_id: int):
+    m = row("SELECT * FROM matches WHERE id=?", (match_id,))
+    if not m:
+        raise HTTPException(404, "Gara non trovata")
+    participants = rows('''SELECT * FROM participants WHERE match_id=?
+                         ORDER BY side, CASE WHEN person_type='player' THEN 0 ELSE 1 END,
+                                  CASE WHEN shirt_no IS NULL THEN 999 ELSE CAST(shirt_no AS INTEGER) END,
+                                  official_role, name''', (match_id,))
+    sanctions = rows('''SELECT * FROM sanctions WHERE match_id=?
+                      ORDER BY person_name, is_derived, ordinal, minute''', (match_id,))
+    assignments = rows("SELECT role,person_name FROM assignments WHERE match_id=? ORDER BY role", (match_id,))
+    by_person = {}
+    for sx in sanctions:
+        key = (sx.get("team") or "", sx.get("person_type"), sx.get("official_role") or "", sx.get("person_name") or "")
+        by_person.setdefault(key, []).append(sx)
+    for p in participants:
+        key = (p.get("team") or "", p.get("person_type"), p.get("official_role") or "", p.get("name") or "")
+        p["sanctions"] = by_person.get(key, [])
+    return {"match": m, "participants": participants, "assignments": assignments}
+
+
 @app.get("/api/team-stats")
 def team_stats(competition: str="ALL"):
     where=""; params=[]
     if competition!="ALL": where=" WHERE m.competition=?"; params=[competition]
     sql=f'''
     WITH tg AS (
-      SELECT m.id,m.competition,m.home_team team,m.home_goals gf,m.away_goals ga FROM matches m WHERE m.status='played'
+      SELECT m.id,m.competition,m.home_team team,m.home_goals gf,m.away_goals ga,
+             m.home_7m_attempts p7a,m.home_7m_scored p7s
+      FROM matches m WHERE m.status='played'
       UNION ALL
-      SELECT m.id,m.competition,m.away_team,m.away_goals,m.home_goals FROM matches m WHERE m.status='played'
+      SELECT m.id,m.competition,m.away_team,m.away_goals,m.home_goals,
+             m.away_7m_attempts,m.away_7m_scored
+      FROM matches m WHERE m.status='played'
     ), sx AS (
       SELECT s.match_id,s.team,
         SUM(CASE WHEN s.sanction_type='2min' AND s.is_derived=0 THEN 1 ELSE 0 END) two_min,
         SUM(CASE WHEN s.sanction_type='disqualification' AND s.is_derived=0 THEN 1 ELSE 0 END) direct_dq,
+        SUM(CASE WHEN s.sanction_type='disqualification_3x2' THEN 1 ELSE 0 END) dq_3x2,
         SUM(CASE WHEN s.person_type='team_official' AND s.is_derived=0 THEN 1 ELSE 0 END) bench_sanctions
       FROM sanctions s GROUP BY s.match_id,s.team
     )
     SELECT tg.team, tg.competition, COUNT(*) games, SUM(gf) gf, SUM(ga) ga,
-           ROUND(AVG(gf),2) avg_gf, COALESCE(SUM(sx.two_min),0) two_min,
-           COALESCE(SUM(sx.direct_dq),0) direct_dq, COALESCE(SUM(sx.bench_sanctions),0) bench_sanctions
+           ROUND(AVG(gf),2) avg_gf,
+           COALESCE(SUM(tg.p7s),0) seven_scored, COALESCE(SUM(tg.p7a),0) seven_attempts,
+           COALESCE(SUM(sx.two_min),0) two_min,
+           COALESCE(SUM(sx.direct_dq),0) direct_dq,
+           COALESCE(SUM(sx.dq_3x2),0) dq_3x2,
+           COALESCE(SUM(sx.direct_dq),0)+COALESCE(SUM(sx.dq_3x2),0) dq_total,
+           COALESCE(SUM(sx.bench_sanctions),0) bench_sanctions
     FROM tg JOIN matches m ON m.id=tg.id LEFT JOIN sx ON sx.match_id=tg.id AND sx.team=tg.team
     {where}
     GROUP BY tg.team,tg.competition ORDER BY tg.competition,tg.team
@@ -334,7 +372,7 @@ async def import_json(request: Request):
 def export_json():
     payload = {
         "generated_at": datetime.now(ZoneInfo(os.getenv("APP_TIMEZONE", "Europe/Rome"))).isoformat(timespec="seconds"),
-        "database_version": 1,
+        "database_version": 2,
         "matches": rows("SELECT * FROM matches ORDER BY competition, round_no, match_no"),
         "participants": rows("SELECT * FROM participants ORDER BY match_id, side, person_type, shirt_no, official_role, name"),
         "sanctions": rows("SELECT * FROM sanctions ORDER BY match_id, team, person_name, minute"),

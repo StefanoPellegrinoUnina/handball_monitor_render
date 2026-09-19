@@ -12,7 +12,7 @@ import pdfplumber
 import requests
 from bs4 import BeautifulSoup
 
-from db import issue, replace_report_details, upsert_match
+from db import issue, replace_report_details, resolve_report_issue, upsert_match
 
 BASE = "https://www.federhandball.it"
 CALENDARS = {
@@ -125,8 +125,17 @@ def discover_calendar(competition: str, url: str) -> list[dict[str, Any]]:
 
 
 def _extract_table_records(page) -> tuple[list[dict], list[dict]]:
-    participants: list[dict] = []
-    sanctions: list[dict] = []
+    """Extract roster rows and sanctions from the two team tables.
+
+    FIGH reports contain several other boxed tables on the same page (score,
+    time-outs, 7m, referees). pdfplumber can expose those as independent
+    tables. Earlier versions kept the last A/B context across tables, which
+    caused numeric cells from the score/time-out boxes to be misread as
+    players. We now accept only tables that actually contain the roster header
+    and reset A/B context for every table.
+    """
+    participants_by_key: dict[tuple, dict] = {}
+    sanctions_by_key: dict[tuple, dict] = {}
     tables = page.extract_tables({
         "vertical_strategy": "lines",
         "horizontal_strategy": "lines",
@@ -135,58 +144,99 @@ def _extract_table_records(page) -> tuple[list[dict], list[dict]]:
         "join_tolerance": 4,
     }) or []
 
-    side = None
-    team = None
     for table in tables:
-        for raw in table:
-            row = [_norm(c) for c in raw]
+        normalized = [[_norm(c) for c in raw] for raw in table]
+        # Ignore score, timeout, 7m and assignment boxes. A real roster table
+        # always includes the "Cognome e Nome" header.
+        if not any(any("Cognome e Nome" in c for c in row) for row in normalized):
+            continue
+
+        side = None
+        team = None
+        for row in normalized:
             if not any(row):
                 continue
-            joined = " | ".join(row)
+            first = row[0] if row else ""
+
             # Team header rows generally have A/B in col 0 and team name in col 1.
-            if row[0] in {"A","B"} and len(row) > 1 and row[1]:
-                side, team = row[0], row[1]
+            if first in {"A", "B"} and len(row) > 1 and row[1]:
+                side, team = first, row[1]
                 continue
             if side is None or team is None:
                 continue
             if any("Cognome e Nome" in c for c in row):
                 continue
-            first = row[0] if row else ""
+
             name = row[1] if len(row) > 1 else ""
-            if not name:
+            # A legitimate person name must contain at least one letter. This
+            # prevents numeric summary cells from ever entering the roster.
+            if not name or not re.search(r"[A-Za-zÀ-ÖØ-öø-ÿ]", name):
                 continue
-            if re.fullmatch(r"\d{1,2}", first):
+
+            if re.fullmatch(r"\d{1,3}", first):
                 ptype, shirt, role = "player", first, None
             elif re.fullmatch(r"UFF\.[ABCD]", first, re.I):
                 ptype, shirt, role = "team_official", None, first.upper()
             else:
                 continue
+
             goals = 0
             if ptype == "player" and len(row) > 2 and re.fullmatch(r"\d+", row[2] or ""):
                 goals = int(row[2])
-            participants.append({"side":side,"team":team,"person_type":ptype,"shirt_no":shirt,"official_role":role,"name":name,"goals":goals})
-            # Expected columns: n°, name, goals, Amm, 2', 2', 2', Sq., San Sq.
-            labels = [(3,"warning",None),(4,"2min",1),(5,"2min",2),(6,"2min",3),(7,"disqualification",None),(8,"san_sq",None)]
+
+            pkey = (side, ptype, shirt or "", role or "", name)
+            prev = participants_by_key.get(pkey)
+            if prev is None:
+                participants_by_key[pkey] = {
+                    "side": side, "team": team, "person_type": ptype,
+                    "shirt_no": shirt, "official_role": role, "name": name,
+                    "goals": goals,
+                }
+            else:
+                # If the same row is exposed twice, preserve the strongest
+                # useful values instead of inserting a duplicate.
+                prev["team"] = team or prev["team"]
+                prev["goals"] = max(int(prev.get("goals") or 0), goals)
+
+            # Standard player columns:
+            # N°, Cognome e Nome, Reti, Amm, 2', 2', 2', Sq., San Sq.
+            # Officials use the same physical grid but only one 2' slot is
+            # meaningful; we therefore never derive a 3x2 disqualification for
+            # officials.
+            labels = [(3, "warning", None), (4, "2min", 1)]
+            if ptype == "player":
+                labels += [(5, "2min", 2), (6, "2min", 3)]
+            labels += [(7, "disqualification", None), (8, "san_sq", None)]
+
             for idx, stype, ordinal in labels:
-                if idx >= len(row) or not row[idx]: continue
-                # A cell can contain one time; keep non-time marks too, flagged as value.
+                if idx >= len(row) or not row[idx]:
+                    continue
                 vals = re.findall(r"\b\d{1,2}:\d{2}\b", row[idx]) or [row[idx]]
                 for val in vals:
-                    sanctions.append({
-                        "side":side,"team":team,"person_type":ptype,"shirt_no":shirt,"official_role":role,
-                        "person_name":name,"sanction_type":stype,"minute":val if ":" in val else None,
-                        "ordinal":ordinal,"is_derived":False,"source_column":str(idx)
-                    })
-            # Explicitly derive third-2' DQ while keeping source events distinct.
-            third = [s for s in sanctions if s.get("side")==side and s.get("person_name")==name and s.get("sanction_type")=="2min" and s.get("ordinal")==3]
-            if third:
-                sanctions.append({
-                    "side":side,"team":team,"person_type":ptype,"shirt_no":shirt,"official_role":role,
-                    "person_name":name,"sanction_type":"disqualification_3x2","minute":third[-1].get("minute"),
-                    "ordinal":None,"is_derived":True,"source_column":"derived"
-                })
-    return participants, sanctions
+                    minute = val if re.fullmatch(r"\d{1,2}:\d{2}", val) else None
+                    skey = (side, ptype, shirt or "", role or "", name, stype, minute or "", ordinal or 0, False)
+                    sanctions_by_key[skey] = {
+                        "side": side, "team": team, "person_type": ptype,
+                        "shirt_no": shirt, "official_role": role,
+                        "person_name": name, "sanction_type": stype,
+                        "minute": minute, "ordinal": ordinal,
+                        "is_derived": False, "source_column": str(idx),
+                    }
 
+            if ptype == "player":
+                third_key_candidates = [k for k in sanctions_by_key if k[0] == side and k[4] == name and k[5] == "2min" and k[7] == 3]
+                if third_key_candidates:
+                    src = sanctions_by_key[third_key_candidates[-1]]
+                    skey = (side, ptype, shirt or "", role or "", name, "disqualification_3x2", src.get("minute") or "", 0, True)
+                    sanctions_by_key[skey] = {
+                        "side": side, "team": team, "person_type": ptype,
+                        "shirt_no": shirt, "official_role": role,
+                        "person_name": name, "sanction_type": "disqualification_3x2",
+                        "minute": src.get("minute"), "ordinal": None,
+                        "is_derived": True, "source_column": "derived",
+                    }
+
+    return list(participants_by_key.values()), list(sanctions_by_key.values())
 
 def parse_report(pdf_bytes: bytes, competition_hint: str | None=None, round_no: int | None=None, source_url: str | None=None) -> dict[str, Any]:
     checksum = hashlib.sha256(pdf_bytes).hexdigest()
@@ -218,6 +268,12 @@ def parse_report(pdf_bytes: bytes, competition_hint: str | None=None, round_no: 
     if score_m:
         home_goals, away_goals = int(score_m.group(1)), int(score_m.group(2))
     ht_m = re.search(r"1°\s*Tempo\s*\n?\s*(\d+)\s+(\d+)", text, re.I)
+    seven_m = re.search(r"7m\.\s*tiri/reti\s*(?:\n|\s)+\s*(\d+)\s*/\s*(\d+)\s+(\d+)\s*/\s*(\d+)", text, re.I)
+    if seven_m:
+        home_7m_attempts, home_7m_scored = int(seven_m.group(1)), int(seven_m.group(2))
+        away_7m_attempts, away_7m_scored = int(seven_m.group(3)), int(seven_m.group(4))
+    else:
+        home_7m_attempts = home_7m_scored = away_7m_attempts = away_7m_scored = None
 
     assignments = []
     for role, pattern in [
@@ -240,6 +296,8 @@ def parse_report(pdf_bytes: bytes, competition_hint: str | None=None, round_no: 
             "venue_city": venue_city, "venue_name": _norm(venue_m.group(1)) if venue_m else None,
             "home_team": home, "away_team": away, "home_goals": home_goals, "away_goals": away_goals,
             "home_ht": int(ht_m.group(1)) if ht_m else None, "away_ht": int(ht_m.group(2)) if ht_m else None,
+            "home_7m_attempts": home_7m_attempts, "home_7m_scored": home_7m_scored,
+            "away_7m_attempts": away_7m_attempts, "away_7m_scored": away_7m_scored,
             "status": "played", "source_url": source_url, "report_url": source_url,
             "report_id": _report_id(source_url) or str(match_no), "checksum": checksum,
         },
@@ -268,6 +326,7 @@ def sync_all() -> dict[str, int]:
                     parsed["match"]["source_url"] = url
                     mid = upsert_match(parsed["match"])
                     replace_report_details(mid, parsed["participants"], parsed["sanctions"], parsed["assignments"])
+                    resolve_report_issue(m["report_url"])
                     stats["imported"] += 1
                 except Exception as e:
                     # keep discovered card if it has a plausible match number, otherwise issue only

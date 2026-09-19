@@ -72,6 +72,10 @@ SQLITE_SCHEMA = [
         away_goals INTEGER,
         home_ht INTEGER,
         away_ht INTEGER,
+        home_7m_attempts INTEGER,
+        home_7m_scored INTEGER,
+        away_7m_attempts INTEGER,
+        away_7m_scored INTEGER,
         status TEXT NOT NULL DEFAULT 'scheduled',
         source_url TEXT,
         report_url TEXT,
@@ -151,6 +155,10 @@ POSTGRES_SCHEMA = [
         away_goals INTEGER,
         home_ht INTEGER,
         away_ht INTEGER,
+        home_7m_attempts INTEGER,
+        home_7m_scored INTEGER,
+        away_7m_attempts INTEGER,
+        away_7m_scored INTEGER,
         status TEXT NOT NULL DEFAULT 'scheduled',
         source_url TEXT,
         report_url TEXT,
@@ -228,6 +236,18 @@ def init_db() -> None:
     with connect() as con:
         for stmt in (POSTGRES_SCHEMA if IS_POSTGRES else SQLITE_SCHEMA):
             con.execute(stmt)
+        # Non-destructive migrations for deployments created with earlier versions.
+        if IS_POSTGRES:
+            for col in (
+                "home_7m_attempts INTEGER", "home_7m_scored INTEGER",
+                "away_7m_attempts INTEGER", "away_7m_scored INTEGER",
+            ):
+                con.execute(f"ALTER TABLE matches ADD COLUMN IF NOT EXISTS {col}")
+        else:
+            existing = {r[1] for r in con.execute("PRAGMA table_info(matches)").fetchall()}
+            for name in ("home_7m_attempts", "home_7m_scored", "away_7m_attempts", "away_7m_scored"):
+                if name not in existing:
+                    con.execute(f"ALTER TABLE matches ADD COLUMN {name} INTEGER")
         for stmt in INDEXES:
             con.execute(stmt)
 
@@ -235,7 +255,8 @@ def init_db() -> None:
 def upsert_match(data: dict[str, Any]) -> int:
     cols = [
         "competition","season","round_no","match_no","played_at","venue_city","venue_name",
-        "home_team","away_team","home_goals","away_goals","home_ht","away_ht","status",
+        "home_team","away_team","home_goals","away_goals","home_ht","away_ht",
+        "home_7m_attempts","home_7m_scored","away_7m_attempts","away_7m_scored","status",
         "source_url","report_url","report_id","checksum"
     ]
     vals = [data.get(c) for c in cols]
@@ -253,6 +274,10 @@ def upsert_match(data: dict[str, Any]) -> int:
           away_goals=COALESCE(excluded.away_goals,matches.away_goals),
           home_ht=COALESCE(excluded.home_ht,matches.home_ht),
           away_ht=COALESCE(excluded.away_ht,matches.away_ht),
+          home_7m_attempts=COALESCE(excluded.home_7m_attempts,matches.home_7m_attempts),
+          home_7m_scored=COALESCE(excluded.home_7m_scored,matches.home_7m_scored),
+          away_7m_attempts=COALESCE(excluded.away_7m_attempts,matches.away_7m_attempts),
+          away_7m_scored=COALESCE(excluded.away_7m_scored,matches.away_7m_scored),
           status=excluded.status,
           source_url=COALESCE(excluded.source_url,matches.source_url),
           report_url=COALESCE(excluded.report_url,matches.report_url),
@@ -273,13 +298,26 @@ def replace_report_details(match_id: int, participants: list[dict], sanctions: l
         con.execute("DELETE FROM assignments WHERE match_id=?", (match_id,))
         participant_ids: dict[tuple, int] = {}
         for p in participants:
+            # Defensive upsert: PDF table engines can occasionally expose the same
+            # roster row more than once. The logical unique key remains authoritative.
             cur = con.execute('''
                 INSERT INTO participants(match_id,side,team,person_type,shirt_no,official_role,name,goals)
-                VALUES(?,?,?,?,?,?,?,?) RETURNING id
+                VALUES(?,?,?,?,?,?,?,?)
+                ON CONFLICT DO NOTHING
+                RETURNING id
             ''', (match_id,p["side"],p["team"],p["person_type"],p.get("shirt_no"),p.get("official_role"),p["name"],p.get("goals",0)))
             rec = cur.fetchone()
-            pid = int(rec["id"] if IS_POSTGRES else rec[0])
             key = (p["side"],p["person_type"],p.get("shirt_no") or "",p.get("official_role") or "",p["name"])
+            if rec:
+                pid = int(rec["id"] if IS_POSTGRES else rec[0])
+            else:
+                found = con.execute('''
+                    SELECT id FROM participants
+                    WHERE match_id=? AND side=? AND person_type=?
+                      AND COALESCE(shirt_no,'')=? AND COALESCE(official_role,'')=? AND name=?
+                ''', (match_id, p["side"], p["person_type"], p.get("shirt_no") or "", p.get("official_role") or "", p["name"])).fetchone()
+                pid = int(found["id"] if IS_POSTGRES else found[0])
+                con.execute("UPDATE participants SET team=?, goals=? WHERE id=?", (p["team"], p.get("goals",0), pid))
             participant_ids[key] = pid
         for s in sanctions:
             key = (s.get("side"),s.get("person_type"),s.get("shirt_no") or "",s.get("official_role") or "",s.get("person_name") or "")
@@ -311,4 +349,15 @@ def issue(match_id: int | None, issue_type: str, message: str, severity: str="wa
         con.execute(
             "INSERT INTO data_issues(match_id,issue_type,severity,message) VALUES(?,?,?,?) ON CONFLICT DO NOTHING",
             (match_id, issue_type, severity, message)
+        )
+
+
+def resolve_report_issue(source_url: str) -> None:
+    """Resolve stale parse errors for a report after a later successful import."""
+    if not source_url:
+        return
+    with connect() as con:
+        con.execute(
+            "UPDATE data_issues SET resolved=1 WHERE issue_type='report_parse' AND resolved=0 AND message LIKE ?",
+            (f"%{source_url}%",),
         )
