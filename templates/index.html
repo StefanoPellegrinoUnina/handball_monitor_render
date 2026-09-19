@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="it">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Handball Monitor Italia</title>
+  <link rel="stylesheet" href="/static/styles.css"/>
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="brand"><div class="brand-mark">HM</div><div><b>Handball Monitor</b><span>Italia · 2026/27</span></div></div>
+      <nav id="nav">
+        <button class="nav-item active" data-view="overview">Panoramica</button>
+        <button class="nav-item" data-view="matches">Gare</button>
+        <button class="nav-item" data-view="teams">Squadre</button>
+        <button class="nav-item" data-view="players">Giocatori</button>
+        <button class="nav-item" data-view="bench">Panchine</button>
+        <button class="nav-item" data-view="officials">Arbitri & delegati</button>
+        <button class="nav-item" data-view="quality">Data quality</button>
+      </nav>
+      <div class="side-note"><strong>Fonti</strong><span>Referti ufficiali FIGH / MPS Service</span><span>Calendari federali</span></div>
+    </aside>
+
+    <main>
+      <header class="topbar">
+        <div><div class="eyebrow">STUDIO STAGIONALE</div><h1 id="page-title">Panoramica</h1></div>
+        <div class="controls">
+          <select id="competition"><option value="ALL">A Gold M + A1 F</option><option>A Gold M</option><option>A1 F</option></select>
+          <a class="ghost export-link" href="/api/export-json">Esporta backup</a>
+          <button id="syncBtn" class="primary">Aggiorna FIGH</button>
+        </div>
+      </header>
+
+      <section id="content"></section>
+    </main>
+  </div>
+  <div id="toast"></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>

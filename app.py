@@ -10,11 +10,12 @@ import threading
 from zoneinfo import ZoneInfo
 from fastapi import FastAPI, HTTPException, Request, UploadFile, File
 from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.encoders import jsonable_encoder
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 
-from db import DB_PATH, connect, init_db, replace_report_details, row, rows, upsert_match
+from db import DB_LABEL, DATABASE_URL, connect, init_db, replace_report_details, row, rows, upsert_match
 from scraper import parse_report, sync_all
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -33,8 +34,9 @@ def run_sync_job():
         return {"status": "busy", "discovered": 0, "imported": 0, "errors": 0}
     try:
         with connect() as con:
-            cur = con.execute("INSERT INTO sync_runs(status) VALUES('running')")
-            run_id = cur.lastrowid
+            cur = con.execute("INSERT INTO sync_runs(status) VALUES('running') RETURNING id")
+            rec = cur.fetchone()
+            run_id = int(rec["id"] if hasattr(rec, "keys") else rec[0])
         try:
             st = sync_all()
             final_status = "ok" if st.get("errors", 0) == 0 else "partial"
@@ -112,6 +114,8 @@ def _initial_sync_if_empty():
 @app.on_event("startup")
 def startup():
     global _scheduler_thread
+    if os.getenv("RENDER") == "true" and not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL non configurato: collega prima il database PostgreSQL esterno.")
     init_db()
     _scheduler_stop.clear()
     threading.Thread(target=_initial_sync_if_empty, name="figh-first-sync", daemon=True).start()
@@ -133,7 +137,7 @@ def home(request: Request):
 @app.get("/healthz")
 def healthz():
     check = row("SELECT COUNT(*) n FROM matches") or {"n": 0}
-    return {"ok": True, "database": str(DB_PATH), "matches": check.get("n", 0)}
+    return {"ok": True, "database": DB_LABEL, "matches": check.get("n", 0)}
 
 
 def comp_filter(comp: str | None):
@@ -160,15 +164,27 @@ def overview(competition: str = "ALL"):
 
 @app.get("/api/matches")
 def matches(competition: str="ALL", round_no: int|None=None):
-    sql="""SELECT m.*,
-      (SELECT group_concat(person_name, ' / ') FROM assignments a WHERE a.match_id=m.id AND a.role LIKE 'Arbitro%') referees,
-      (SELECT group_concat(person_name, ' / ') FROM assignments a WHERE a.match_id=m.id AND a.role LIKE 'Commissario%') delegates
-      FROM matches m WHERE 1=1"""
+    sql="SELECT m.* FROM matches m WHERE 1=1"
     params=[]
     if competition!="ALL": sql+=" AND competition=?"; params.append(competition)
     if round_no is not None: sql+=" AND round_no=?"; params.append(round_no)
     sql+=" ORDER BY COALESCE(played_at,'9999'), competition, round_no, match_no"
-    return rows(sql,params)
+    data = rows(sql,params)
+    if not data:
+        return data
+    aids = rows("SELECT match_id, role, person_name FROM assignments ORDER BY match_id, role, person_name")
+    by_match = {}
+    for a in aids:
+        bucket = by_match.setdefault(a["match_id"], {"referees": [], "delegates": []})
+        if str(a["role"]).lower().startswith("arbitro"):
+            bucket["referees"].append(a["person_name"])
+        elif str(a["role"]).lower().startswith("commissario") or str(a["role"]).lower().startswith("delegato"):
+            bucket["delegates"].append(a["person_name"])
+    for m in data:
+        bucket = by_match.get(m["id"], {"referees": [], "delegates": []})
+        m["referees"] = " / ".join(bucket["referees"]) or None
+        m["delegates"] = " / ".join(bucket["delegates"]) or None
+    return data
 
 
 @app.get("/api/team-stats")
@@ -273,6 +289,28 @@ def sync():
     return {"ok": result.get("status") in {"ok", "partial"}, "result": result, "last": row("SELECT * FROM sync_runs ORDER BY id DESC LIMIT 1")}
 
 
+@app.post("/api/sync-scheduled")
+def sync_scheduled(request: Request, force: bool=False):
+    expected = os.getenv("SYNC_TOKEN", "").strip()
+    supplied = request.headers.get("X-Sync-Token", "")
+    if not expected or supplied != expected:
+        raise HTTPException(401, "Token di sincronizzazione non valido")
+
+    # GitHub Actions uses two UTC slots around each Europe/Rome target to survive DST.
+    # Only the invocation that lands in an allowed local hour actually performs the sync.
+    if not force:
+        tz = ZoneInfo(os.getenv("APP_TIMEZONE", "Europe/Rome"))
+        now = datetime.now(tz)
+        allowed = {int(x.strip()) for x in os.getenv("SCHEDULE_HOURS", "7,23").split(",") if x.strip().isdigit()}
+        if now.hour not in allowed:
+            return {"ok": True, "skipped": True, "local_time": now.isoformat(timespec="minutes")}
+
+    result = run_sync_job()
+    if result.get("status") == "busy":
+        raise HTTPException(409, "Una sincronizzazione è già in corso")
+    return {"ok": result.get("status") in {"ok", "partial"}, "result": result}
+
+
 @app.post("/api/import-report")
 async def import_report(file: UploadFile = File(...), competition: str="A Gold M", round_no: int|None=None):
     body=await file.read()
@@ -306,6 +344,6 @@ def export_json():
     }
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     return JSONResponse(
-        content=payload,
+        content=jsonable_encoder(payload),
         headers={"Content-Disposition": f'attachment; filename="handball_monitor_backup_{stamp}.json"'},
     )

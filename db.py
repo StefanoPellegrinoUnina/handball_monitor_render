@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import os
 import sqlite3
 from contextlib import contextmanager
@@ -8,120 +7,229 @@ from pathlib import Path
 from typing import Any, Iterable
 
 BASE_DIR = Path(__file__).resolve().parent
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+IS_POSTGRES = DATABASE_URL.startswith("postgres://") or DATABASE_URL.startswith("postgresql://")
 DB_PATH = Path(os.getenv("HANDBALL_DB_PATH", str(BASE_DIR / "data" / "handball.sqlite3"))).expanduser()
+DB_LABEL = "PostgreSQL" if IS_POSTGRES else str(DB_PATH)
 
-SCHEMA = r'''
-PRAGMA foreign_keys = ON;
+if IS_POSTGRES:
+    import psycopg
+    from psycopg.rows import dict_row
 
-CREATE TABLE IF NOT EXISTS matches (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    competition TEXT NOT NULL,
-    season TEXT NOT NULL,
-    round_no INTEGER,
-    match_no INTEGER,
-    played_at TEXT,
-    venue_city TEXT,
-    venue_name TEXT,
-    home_team TEXT NOT NULL,
-    away_team TEXT NOT NULL,
-    home_goals INTEGER,
-    away_goals INTEGER,
-    home_ht INTEGER,
-    away_ht INTEGER,
-    status TEXT NOT NULL DEFAULT 'scheduled',
-    source_url TEXT,
-    report_url TEXT,
-    report_id TEXT,
-    checksum TEXT,
-    last_seen_at TEXT DEFAULT CURRENT_TIMESTAMP,
-    updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(competition, season, match_no)
-);
 
-CREATE TABLE IF NOT EXISTS participants (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    match_id INTEGER NOT NULL REFERENCES matches(id) ON DELETE CASCADE,
-    side TEXT NOT NULL CHECK(side IN ('A','B')),
-    team TEXT NOT NULL,
-    person_type TEXT NOT NULL CHECK(person_type IN ('player','team_official')),
-    shirt_no TEXT,
-    official_role TEXT,
-    name TEXT NOT NULL,
-    goals INTEGER DEFAULT 0
-);
+def _sql(sql: str) -> str:
+    """Translate qmark placeholders to psycopg placeholders when needed."""
+    return sql.replace("?", "%s") if IS_POSTGRES else sql
 
-CREATE TABLE IF NOT EXISTS sanctions (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    match_id INTEGER NOT NULL REFERENCES matches(id) ON DELETE CASCADE,
-    participant_id INTEGER REFERENCES participants(id) ON DELETE CASCADE,
-    team TEXT NOT NULL,
-    person_name TEXT,
-    person_type TEXT,
-    official_role TEXT,
-    sanction_type TEXT NOT NULL,
-    minute TEXT,
-    ordinal INTEGER,
-    is_derived INTEGER NOT NULL DEFAULT 0,
-    source_column TEXT
-);
-
-CREATE TABLE IF NOT EXISTS assignments (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    match_id INTEGER NOT NULL REFERENCES matches(id) ON DELETE CASCADE,
-    role TEXT NOT NULL,
-    person_name TEXT NOT NULL,
-    UNIQUE(match_id, role, person_name)
-);
-
-CREATE TABLE IF NOT EXISTS sync_runs (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    started_at TEXT DEFAULT CURRENT_TIMESTAMP,
-    finished_at TEXT,
-    status TEXT NOT NULL DEFAULT 'running',
-    discovered INTEGER DEFAULT 0,
-    imported INTEGER DEFAULT 0,
-    updated INTEGER DEFAULT 0,
-    errors INTEGER DEFAULT 0,
-    notes TEXT
-);
-
-CREATE TABLE IF NOT EXISTS data_issues (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    match_id INTEGER REFERENCES matches(id) ON DELETE CASCADE,
-    issue_type TEXT NOT NULL,
-    severity TEXT NOT NULL DEFAULT 'warning',
-    message TEXT NOT NULL,
-    resolved INTEGER NOT NULL DEFAULT 0,
-    created_at TEXT DEFAULT CURRENT_TIMESTAMP
-);
-'''
 
 @contextmanager
 def connect():
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    con = sqlite3.connect(DB_PATH)
-    con.row_factory = sqlite3.Row
-    con.execute("PRAGMA foreign_keys=ON")
-    con.execute("PRAGMA journal_mode=WAL")
-    con.execute("PRAGMA busy_timeout=5000")
-    try:
-        yield con
-        con.commit()
-    finally:
-        con.close()
+    if IS_POSTGRES:
+        con = psycopg.connect(DATABASE_URL, row_factory=dict_row, connect_timeout=15)
+        try:
+            yield _ConnectionProxy(con)
+            con.commit()
+        except Exception:
+            con.rollback()
+            raise
+        finally:
+            con.close()
+    else:
+        DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+        con = sqlite3.connect(DB_PATH)
+        con.row_factory = sqlite3.Row
+        con.execute("PRAGMA foreign_keys=ON")
+        con.execute("PRAGMA journal_mode=WAL")
+        con.execute("PRAGMA busy_timeout=5000")
+        try:
+            yield _ConnectionProxy(con)
+            con.commit()
+        finally:
+            con.close()
+
+
+class _ConnectionProxy:
+    def __init__(self, con):
+        self._con = con
+
+    def execute(self, sql: str, params: Iterable[Any] = ()):
+        return self._con.execute(_sql(sql), tuple(params))
+
+
+SQLITE_SCHEMA = [
+    '''CREATE TABLE IF NOT EXISTS matches (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        competition TEXT NOT NULL,
+        season TEXT NOT NULL,
+        round_no INTEGER,
+        match_no INTEGER,
+        played_at TEXT,
+        venue_city TEXT,
+        venue_name TEXT,
+        home_team TEXT NOT NULL,
+        away_team TEXT NOT NULL,
+        home_goals INTEGER,
+        away_goals INTEGER,
+        home_ht INTEGER,
+        away_ht INTEGER,
+        status TEXT NOT NULL DEFAULT 'scheduled',
+        source_url TEXT,
+        report_url TEXT,
+        report_id TEXT,
+        checksum TEXT,
+        last_seen_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(competition, season, match_no)
+    )''',
+    '''CREATE TABLE IF NOT EXISTS participants (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        match_id INTEGER NOT NULL REFERENCES matches(id) ON DELETE CASCADE,
+        side TEXT NOT NULL CHECK(side IN ('A','B')),
+        team TEXT NOT NULL,
+        person_type TEXT NOT NULL CHECK(person_type IN ('player','team_official')),
+        shirt_no TEXT,
+        official_role TEXT,
+        name TEXT NOT NULL,
+        goals INTEGER DEFAULT 0
+    )''',
+    '''CREATE TABLE IF NOT EXISTS sanctions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        match_id INTEGER NOT NULL REFERENCES matches(id) ON DELETE CASCADE,
+        participant_id INTEGER REFERENCES participants(id) ON DELETE CASCADE,
+        team TEXT NOT NULL,
+        person_name TEXT,
+        person_type TEXT,
+        official_role TEXT,
+        sanction_type TEXT NOT NULL,
+        minute TEXT,
+        ordinal INTEGER,
+        is_derived INTEGER NOT NULL DEFAULT 0,
+        source_column TEXT
+    )''',
+    '''CREATE TABLE IF NOT EXISTS assignments (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        match_id INTEGER NOT NULL REFERENCES matches(id) ON DELETE CASCADE,
+        role TEXT NOT NULL,
+        person_name TEXT NOT NULL,
+        UNIQUE(match_id, role, person_name)
+    )''',
+    '''CREATE TABLE IF NOT EXISTS sync_runs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        started_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        finished_at TEXT,
+        status TEXT NOT NULL DEFAULT 'running',
+        discovered INTEGER DEFAULT 0,
+        imported INTEGER DEFAULT 0,
+        updated INTEGER DEFAULT 0,
+        errors INTEGER DEFAULT 0,
+        notes TEXT
+    )''',
+    '''CREATE TABLE IF NOT EXISTS data_issues (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        match_id INTEGER REFERENCES matches(id) ON DELETE CASCADE,
+        issue_type TEXT NOT NULL,
+        severity TEXT NOT NULL DEFAULT 'warning',
+        message TEXT NOT NULL,
+        resolved INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )''',
+]
+
+POSTGRES_SCHEMA = [
+    '''CREATE TABLE IF NOT EXISTS matches (
+        id BIGSERIAL PRIMARY KEY,
+        competition TEXT NOT NULL,
+        season TEXT NOT NULL,
+        round_no INTEGER,
+        match_no INTEGER,
+        played_at TEXT,
+        venue_city TEXT,
+        venue_name TEXT,
+        home_team TEXT NOT NULL,
+        away_team TEXT NOT NULL,
+        home_goals INTEGER,
+        away_goals INTEGER,
+        home_ht INTEGER,
+        away_ht INTEGER,
+        status TEXT NOT NULL DEFAULT 'scheduled',
+        source_url TEXT,
+        report_url TEXT,
+        report_id TEXT,
+        checksum TEXT,
+        last_seen_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(competition, season, match_no)
+    )''',
+    '''CREATE TABLE IF NOT EXISTS participants (
+        id BIGSERIAL PRIMARY KEY,
+        match_id BIGINT NOT NULL REFERENCES matches(id) ON DELETE CASCADE,
+        side TEXT NOT NULL CHECK(side IN ('A','B')),
+        team TEXT NOT NULL,
+        person_type TEXT NOT NULL CHECK(person_type IN ('player','team_official')),
+        shirt_no TEXT,
+        official_role TEXT,
+        name TEXT NOT NULL,
+        goals INTEGER DEFAULT 0
+    )''',
+    '''CREATE TABLE IF NOT EXISTS sanctions (
+        id BIGSERIAL PRIMARY KEY,
+        match_id BIGINT NOT NULL REFERENCES matches(id) ON DELETE CASCADE,
+        participant_id BIGINT REFERENCES participants(id) ON DELETE CASCADE,
+        team TEXT NOT NULL,
+        person_name TEXT,
+        person_type TEXT,
+        official_role TEXT,
+        sanction_type TEXT NOT NULL,
+        minute TEXT,
+        ordinal INTEGER,
+        is_derived INTEGER NOT NULL DEFAULT 0,
+        source_column TEXT
+    )''',
+    '''CREATE TABLE IF NOT EXISTS assignments (
+        id BIGSERIAL PRIMARY KEY,
+        match_id BIGINT NOT NULL REFERENCES matches(id) ON DELETE CASCADE,
+        role TEXT NOT NULL,
+        person_name TEXT NOT NULL,
+        UNIQUE(match_id, role, person_name)
+    )''',
+    '''CREATE TABLE IF NOT EXISTS sync_runs (
+        id BIGSERIAL PRIMARY KEY,
+        started_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+        finished_at TIMESTAMPTZ,
+        status TEXT NOT NULL DEFAULT 'running',
+        discovered INTEGER DEFAULT 0,
+        imported INTEGER DEFAULT 0,
+        updated INTEGER DEFAULT 0,
+        errors INTEGER DEFAULT 0,
+        notes TEXT
+    )''',
+    '''CREATE TABLE IF NOT EXISTS data_issues (
+        id BIGSERIAL PRIMARY KEY,
+        match_id BIGINT REFERENCES matches(id) ON DELETE CASCADE,
+        issue_type TEXT NOT NULL,
+        severity TEXT NOT NULL DEFAULT 'warning',
+        message TEXT NOT NULL,
+        resolved INTEGER NOT NULL DEFAULT 0,
+        created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+    )''',
+]
+
+INDEXES = [
+    '''CREATE UNIQUE INDEX IF NOT EXISTS uq_participants
+       ON participants(match_id, side, person_type, COALESCE(shirt_no,''), COALESCE(official_role,''), name)''',
+    '''CREATE UNIQUE INDEX IF NOT EXISTS uq_sanctions
+       ON sanctions(match_id, team, COALESCE(person_name,''), sanction_type, COALESCE(minute,''), COALESCE(ordinal,0), is_derived)''',
+    '''CREATE UNIQUE INDEX IF NOT EXISTS uq_data_issues
+       ON data_issues(COALESCE(match_id,0), issue_type, message)''',
+]
 
 
 def init_db() -> None:
     with connect() as con:
-        con.executescript(SCHEMA)
-        con.executescript('''
-        CREATE UNIQUE INDEX IF NOT EXISTS uq_participants
-        ON participants(match_id, side, person_type, IFNULL(shirt_no,''), IFNULL(official_role,''), name);
-        CREATE UNIQUE INDEX IF NOT EXISTS uq_sanctions
-        ON sanctions(match_id, team, IFNULL(person_name,''), sanction_type, IFNULL(minute,''), IFNULL(ordinal,0), is_derived);
-        CREATE UNIQUE INDEX IF NOT EXISTS uq_data_issues
-        ON data_issues(IFNULL(match_id,0), issue_type, message);
-        ''')
+        for stmt in (POSTGRES_SCHEMA if IS_POSTGRES else SQLITE_SCHEMA):
+            con.execute(stmt)
+        for stmt in INDEXES:
+            con.execute(stmt)
 
 
 def upsert_match(data: dict[str, Any]) -> int:
@@ -132,7 +240,7 @@ def upsert_match(data: dict[str, Any]) -> int:
     ]
     vals = [data.get(c) for c in cols]
     with connect() as con:
-        con.execute(f'''
+        cur = con.execute(f'''
         INSERT INTO matches ({','.join(cols)}) VALUES ({','.join('?' for _ in cols)})
         ON CONFLICT(competition, season, match_no) DO UPDATE SET
           round_no=excluded.round_no,
@@ -152,12 +260,10 @@ def upsert_match(data: dict[str, Any]) -> int:
           checksum=COALESCE(excluded.checksum,matches.checksum),
           last_seen_at=CURRENT_TIMESTAMP,
           updated_at=CURRENT_TIMESTAMP
+        RETURNING id
         ''', vals)
-        row = con.execute(
-            "SELECT id FROM matches WHERE competition=? AND season=? AND match_no=?",
-            (data["competition"], data["season"], data["match_no"])
-        ).fetchone()
-        return int(row["id"])
+        rec = cur.fetchone()
+        return int(rec["id"] if IS_POSTGRES else rec[0])
 
 
 def replace_report_details(match_id: int, participants: list[dict], sanctions: list[dict], assignments: list[dict]) -> None:
@@ -169,35 +275,40 @@ def replace_report_details(match_id: int, participants: list[dict], sanctions: l
         for p in participants:
             cur = con.execute('''
                 INSERT INTO participants(match_id,side,team,person_type,shirt_no,official_role,name,goals)
-                VALUES(?,?,?,?,?,?,?,?)
+                VALUES(?,?,?,?,?,?,?,?) RETURNING id
             ''', (match_id,p["side"],p["team"],p["person_type"],p.get("shirt_no"),p.get("official_role"),p["name"],p.get("goals",0)))
+            rec = cur.fetchone()
+            pid = int(rec["id"] if IS_POSTGRES else rec[0])
             key = (p["side"],p["person_type"],p.get("shirt_no") or "",p.get("official_role") or "",p["name"])
-            participant_ids[key] = cur.lastrowid
+            participant_ids[key] = pid
         for s in sanctions:
             key = (s.get("side"),s.get("person_type"),s.get("shirt_no") or "",s.get("official_role") or "",s.get("person_name") or "")
             pid = participant_ids.get(key)
             con.execute('''
-                INSERT OR IGNORE INTO sanctions(match_id,participant_id,team,person_name,person_type,official_role,sanction_type,minute,ordinal,is_derived,source_column)
+                INSERT INTO sanctions(match_id,participant_id,team,person_name,person_type,official_role,sanction_type,minute,ordinal,is_derived,source_column)
                 VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT DO NOTHING
             ''', (match_id,pid,s["team"],s.get("person_name"),s.get("person_type"),s.get("official_role"),s["sanction_type"],s.get("minute"),s.get("ordinal"),1 if s.get("is_derived") else 0,s.get("source_column")))
         for a in assignments:
-            con.execute("INSERT OR IGNORE INTO assignments(match_id,role,person_name) VALUES(?,?,?)", (match_id,a["role"],a["person_name"]))
+            con.execute("INSERT INTO assignments(match_id,role,person_name) VALUES(?,?,?) ON CONFLICT DO NOTHING", (match_id,a["role"],a["person_name"]))
 
 
 def rows(sql: str, params: Iterable[Any]=()) -> list[dict[str, Any]]:
     with connect() as con:
-        return [dict(r) for r in con.execute(sql, tuple(params)).fetchall()]
+        cur = con.execute(sql, params)
+        fetched = cur.fetchall()
+        return [dict(r) for r in fetched]
 
 
 def row(sql: str, params: Iterable[Any]=()) -> dict[str, Any] | None:
     with connect() as con:
-        r = con.execute(sql, tuple(params)).fetchone()
+        r = con.execute(sql, params).fetchone()
         return dict(r) if r else None
 
 
 def issue(match_id: int | None, issue_type: str, message: str, severity: str="warning") -> None:
     with connect() as con:
         con.execute(
-            "INSERT OR IGNORE INTO data_issues(match_id,issue_type,severity,message) VALUES(?,?,?,?)",
+            "INSERT INTO data_issues(match_id,issue_type,severity,message) VALUES(?,?,?,?) ON CONFLICT DO NOTHING",
             (match_id, issue_type, severity, message)
         )

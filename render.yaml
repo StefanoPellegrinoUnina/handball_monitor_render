@@ -3,25 +3,21 @@ services:
     name: handball-monitor-italia
     runtime: python
     region: frankfurt
-    plan: 0.5c-512mb
+    plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /healthz
     numInstances: 1
     envVars:
-      - key: HANDBALL_DB_PATH
-        value: /var/data/handball.sqlite3
+      - key: DATABASE_URL
+        sync: false
       - key: APP_TIMEZONE
         value: Europe/Rome
-      - key: SYNC_TIMES
-        value: 23:10,07:15
-      - key: SYNC_DAYS
-        value: "*"
       - key: AUTO_SYNC_ON_EMPTY_DB
         value: "1"
       - key: DISABLE_SCHEDULER
-        value: "0"
-    disk:
-      name: handball-data
-      mountPath: /var/data
-      sizeGB: 1
+        value: "1"
+      - key: SCHEDULE_HOURS
+        value: "7,23"
+      - key: SYNC_TOKEN
+        generateValue: true
