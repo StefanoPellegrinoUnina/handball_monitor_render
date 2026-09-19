@@ -19,7 +19,7 @@ from db import DB_LABEL, DATABASE_URL, connect, init_db, replace_report_details,
 from scraper import parse_report, sync_all
 
 BASE_DIR = Path(__file__).resolve().parent
-app = FastAPI(title="Handball Monitor Italia", version="0.1.0")
+app = FastAPI(title="Handball Monitor Italia", version="0.3.0")
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
 templates = Jinja2Templates(directory=BASE_DIR / "templates")
 
@@ -137,7 +137,7 @@ def home(request: Request):
 @app.get("/healthz")
 def healthz():
     check = row("SELECT COUNT(*) n FROM matches") or {"n": 0}
-    return {"ok": True, "database": DB_LABEL, "matches": check.get("n", 0)}
+    return {"ok": True, "version": "0.3.0", "database": DB_LABEL, "matches": check.get("n", 0)}
 
 
 def comp_filter(comp: str | None):
@@ -275,6 +275,33 @@ def players(competition: str="ALL", q: str=""):
     if q: sql+=" AND pg.name LIKE ?"; params.append(f"%{q}%")
     sql+=" GROUP BY pg.name,pg.team,pg.competition ORDER BY goals DESC,pg.name"
     return rows(sql,params)
+
+
+@app.get("/api/team-officials")
+def team_officials(competition: str="ALL"):
+    sql = """SELECT p.id,p.match_id,p.side,p.team,p.official_role,p.name,
+                    m.competition,m.round_no,m.played_at,m.home_team,m.away_team,m.report_url
+             FROM participants p JOIN matches m ON m.id=p.match_id
+             WHERE p.person_type='team_official' """
+    params=[]
+    if competition!="ALL":
+        sql += " AND m.competition=?"
+        params.append(competition)
+    sql += " ORDER BY m.played_at DESC,p.team,p.official_role,p.name"
+    data = rows(sql, params)
+    if not data:
+        return data
+    ids=[x["id"] for x in data]
+    placeholders=','.join('?' for _ in ids)
+    sx = rows(f"""SELECT participant_id,sanction_type,minute,ordinal,is_derived
+                  FROM sanctions WHERE participant_id IN ({placeholders})
+                  ORDER BY participant_id,is_derived,ordinal,minute""", ids)
+    by_id={}
+    for x in sx:
+        by_id.setdefault(x["participant_id"],[]).append(x)
+    for x in data:
+        x["sanctions"] = by_id.get(x["id"],[])
+    return data
 
 
 @app.get("/api/sanctions")

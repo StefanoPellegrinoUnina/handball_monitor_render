@@ -13,6 +13,10 @@ function sanctionCell(p,type){
   const xs=(p.sanctions||[]).filter(s=>s.sanction_type===type && !s.is_derived);
   return xs.map(s=>s.minute||'✓').join(', ')||'—';
 }
+function sanctionOrdinalCell(p,type,ordinal){
+  const xs=(p.sanctions||[]).filter(s=>s.sanction_type===type && !s.is_derived && Number(s.ordinal||0)===Number(ordinal));
+  return xs.map(s=>s.minute||'✓').join(', ')||'—';
+}
 function dqCell(p){
   const direct=(p.sanctions||[]).filter(s=>s.sanction_type==='disqualification'&&!s.is_derived).map(s=>s.minute||'✓');
   const derived=(p.sanctions||[]).filter(s=>s.sanction_type==='disqualification_3x2').map(s=>`${s.minute||'✓'} (3×2′)`);
@@ -41,15 +45,17 @@ async function players(){
  $('#content').innerHTML=panel('Giocatori','reti e disciplina',table(['Camp.','Giocatore','Squadra','G','Gol',"2′",'DQ dirette','DQ da 3×2′'],rows));
 }
 async function bench(){
- const data=await api('/api/sanctions?bench_only=true&'+q());
- const rows=data.map(x=>`<tr><td><span class="badge">${esc(x.competition)}</span></td><td>${fmtDate(x.played_at)}</td><td class="row-title">${esc(x.team)}</td><td>${esc(x.official_role||'—')}</td><td class="row-title">${esc(x.person_name)}</td><td><span class="badge red">${esc(x.sanction_type)}</span></td><td>${esc(x.minute||'—')}</td><td>${esc(x.home_team)} – ${esc(x.away_team)}</td><td>${x.report_url?`<a class="link" target="_blank" href="${esc(x.report_url)}">Fonte</a>`:''}</td></tr>`);
- $('#content').innerHTML=panel('Sanzioni panchine','ammonizioni, singolo 2′, squalifiche e relativo minuto',table(['Camp.','Data','Squadra','Ruolo','Ufficiale','Sanzione','Minuto','Gara',''],rows));
+ const data=await api('/api/team-officials?'+q());
+ const rows=data.map(x=>`<tr><td><span class="badge">${esc(x.competition)}</span></td><td>${fmtDate(x.played_at)}</td><td class="row-title">${esc(x.team)}</td><td>${esc(x.official_role||'—')}</td><td class="row-title">${esc(x.name)}</td><td>${sanctionCell(x,'warning')}</td><td>${sanctionCell(x,'2min')}</td><td>${dqCell(x)}</td><td>${sanctionCell(x,'san_sq')}</td><td>${esc(x.home_team)} – ${esc(x.away_team)}</td><td>${x.report_url?`<a class="link" target="_blank" href="${esc(x.report_url)}">Fonte</a>`:''}</td></tr>`);
+ $('#content').innerHTML=panel('Ufficiali di squadra','presenze e sanzioni · UFF.A / UFF.B / UFF.C / UFF.D',table(['Camp.','Data','Squadra','Ruolo','Ufficiale','Amm.',"2′",'Sq.','San Sq.','Gara',''],rows));
 }
+
 async function officials(){
  const data=await api('/api/pairs?'+q());
- const rows=data.map(x=>`<tr><td><span class="badge">${esc(x.competition)}</span></td><td>${fmtDate(x.played_at)}</td><td>${x.round_no??'—'}</td><td>${esc(x.home_team)} – ${esc(x.away_team)}</td><td class="row-title">${esc(x.r1||'—')} / ${esc(x.r2||'—')}</td><td>${esc([x.d1,x.d2].filter(Boolean).join(' / ')||'—')}</td><td><a class="link" href="#" onclick="showMatch(${x.id});return false">Dettaglio</a>${x.report_url?` · <a class="link" target="_blank" href="${esc(x.report_url)}">Referto</a>`:''}</td></tr>`);
- $('#content').innerHTML=panel('Arbitri & delegati','storico delle uscite',table(['Camp.','Data','Giorn.','Partita','Coppia','Delegato/i',''],rows));
+ const rows=data.map(x=>`<tr><td><span class="badge">${esc(x.competition)}</span></td><td>${fmtDate(x.played_at)}</td><td>${x.round_no??'—'}</td><td>${esc(x.home_team)} – ${esc(x.away_team)}</td><td class="row-title">${esc(x.r1||'—')}</td><td class="row-title">${esc(x.r2||'—')}</td><td>${esc(x.d1||'—')}</td><td>${esc(x.d2||'—')}</td><td><a class="link" href="#" onclick="showMatch(${x.id});return false">Dettaglio</a>${x.report_url?` · <a class="link" target="_blank" href="${esc(x.report_url)}">Referto</a>`:''}</td></tr>`);
+ $('#content').innerHTML=panel('Arbitri & delegati','le designazioni sono lette dal box laterale del referto, non dal testo lineare',table(['Camp.','Data','Giorn.','Partita','Arbitro 1','Arbitro 2','Commissario/Delegato 1','Commissario/Delegato 2',''],rows));
 }
+
 async function quality(){
  const issues=await api('/api/issues');
  const cards=issues.length?issues.map(x=>`<div class="quality-card"><strong>${esc(x.issue_type)} · ${esc(x.severity)}</strong><span>${esc(x.message)}</span></div>`).join(''):'<div class="empty">Nessuna anomalia aperta.</div>';
@@ -61,13 +67,15 @@ window.showMatch=async function(id){
  try{
    const d=await api(`/api/match/${id}`), m=d.match;
    const assigns=Object.fromEntries(d.assignments.map(a=>[a.role,a.person_name]));
-   const roster=side=>d.participants.filter(p=>p.side===side).map(p=>`<tr><td>${esc(p.shirt_no||p.official_role||'—')}</td><td class="row-title">${esc(p.name)}</td><td>${p.person_type==='player'?p.goals:'—'}</td><td>${sanctionCell(p,'warning')}</td><td>${sanctionCell(p,'2min')}</td><td>${dqCell(p)}</td><td>${sanctionCell(p,'san_sq')}</td></tr>`);
-   const summary=`<div class="grid-kpi"><div class="kpi"><div class="label">Risultato</div><div class="value">${m.home_goals}–${m.away_goals}</div><div class="sub">${esc(m.home_team)} · ${esc(m.away_team)}</div></div><div class="kpi"><div class="label">7m casa</div><div class="value">${sevenMatch(m.home_7m_scored,m.home_7m_attempts)}</div><div class="sub">reti/tiri</div></div><div class="kpi"><div class="label">7m trasferta</div><div class="value">${sevenMatch(m.away_7m_scored,m.away_7m_attempts)}</div><div class="sub">reti/tiri</div></div><div class="kpi"><div class="label">Arbitri</div><div class="value compact">${esc([assigns['Arbitro 1'],assigns['Arbitro 2']].filter(Boolean).join(' / ')||'—')}</div><div class="sub">coppia</div></div><div class="kpi"><div class="label">Delegato</div><div class="value compact">${esc([assigns['Commissario 1'],assigns['Commissario 2']].filter(Boolean).join(' / ')||'—')}</div><div class="sub">commissario/i</div></div></div>`;
-   const a=panel(esc(m.home_team),'A',table(['N°/Ruolo','Nome','Gol','Amm.',"2′",'Sq.','San Sq.'],roster('A')));
-   const b=panel(esc(m.away_team),'B',table(['N°/Ruolo','Nome','Gol','Amm.',"2′",'Sq.','San Sq.'],roster('B')));
+   const players=side=>d.participants.filter(p=>p.side===side&&p.person_type==='player').map(p=>`<tr><td>${esc(p.shirt_no||'—')}</td><td class="row-title">${esc(p.name)}</td><td>${p.goals}</td><td>${sanctionCell(p,'warning')}</td><td>${sanctionOrdinalCell(p,'2min',1)}</td><td>${sanctionOrdinalCell(p,'2min',2)}</td><td>${sanctionOrdinalCell(p,'2min',3)}</td><td>${dqCell(p)}</td><td>${sanctionCell(p,'san_sq')}</td></tr>`);
+   const teamOfficials=side=>d.participants.filter(p=>p.side===side&&p.person_type==='team_official').map(p=>`<tr><td>${esc(p.official_role||'—')}</td><td class="row-title">${esc(p.name)}</td><td>${sanctionCell(p,'warning')}</td><td>${sanctionCell(p,'2min')}</td><td>${dqCell(p)}</td><td>${sanctionCell(p,'san_sq')}</td></tr>`);
+   const summary=`<div class="grid-kpi"><div class="kpi"><div class="label">Risultato</div><div class="value">${m.home_goals}–${m.away_goals}</div><div class="sub">${esc(m.home_team)} · ${esc(m.away_team)}</div></div><div class="kpi"><div class="label">1° tempo</div><div class="value">${m.home_ht??'—'}–${m.away_ht??'—'}</div><div class="sub">parziale</div></div><div class="kpi"><div class="label">7m casa</div><div class="value">${sevenMatch(m.home_7m_scored,m.home_7m_attempts)}</div><div class="sub">reti/tiri</div></div><div class="kpi"><div class="label">7m trasferta</div><div class="value">${sevenMatch(m.away_7m_scored,m.away_7m_attempts)}</div><div class="sub">reti/tiri</div></div><div class="kpi"><div class="label">Arbitro 1</div><div class="value compact">${esc(assigns['Arbitro 1']||'—')}</div><div class="sub">box referto</div></div><div class="kpi"><div class="label">Arbitro 2</div><div class="value compact">${esc(assigns['Arbitro 2']||'—')}</div><div class="sub">box referto</div></div><div class="kpi"><div class="label">Commissario / delegato</div><div class="value compact">${esc([assigns['Commissario 1'],assigns['Delegato 1']].filter(Boolean).join(' / ')||'—')}</div><div class="sub">slot 1</div></div><div class="kpi"><div class="label">Commissario / delegato 2</div><div class="value compact">${esc([assigns['Commissario 2'],assigns['Delegato 2']].filter(Boolean).join(' / ')||'—')}</div><div class="sub">slot 2</div></div></div>`;
+   const teamPanel=(side,name)=>panel(esc(name),side,`<div class="subsection-title">Giocatori</div>${table(['N°','Nome','Gol','Amm.',"2′ #1","2′ #2","2′ #3",'Sq.','San Sq.'],players(side))}<div class="subsection-title">Ufficiali di squadra</div>${table(['Ruolo','Nome','Amm.',"2′",'Sq.','San Sq.'],teamOfficials(side))}`);
+   const a=teamPanel('A',m.home_team), b=teamPanel('B',m.away_team);
    $('#content').innerHTML=`<div style="margin-bottom:14px"><a class="link" href="#" onclick="state.view='matches';document.querySelector('[data-view=matches]').click();return false">← Torna alle gare</a>${m.report_url?` · <a class="link" target="_blank" href="${esc(m.report_url)}">Apri referto ufficiale</a>`:''}</div>${summary}<div class="split">${a}${b}</div>`;
  }catch(e){$('#content').innerHTML=`<div class="panel"><div class="empty">Errore: ${esc(e.message)}</div></div>`}
 }
+
 const renderers={overview,matches,teams,players,bench,officials,quality};
 async function render(){const names={overview:'Panoramica',matches:'Gare',teams:'Squadre',players:'Giocatori',bench:'Panchine',officials:'Arbitri & delegati',quality:'Data quality'};$('#page-title').textContent=names[state.view];$('#content').innerHTML='<div class="empty">Caricamento…</div>';try{await renderers[state.view]()}catch(e){$('#content').innerHTML=`<div class="panel"><div class="empty">Errore: ${esc(e.message)}</div></div>`}}
 $$('.nav-item').forEach(b=>b.addEventListener('click',()=>{$$('.nav-item').forEach(x=>x.classList.remove('active'));b.classList.add('active');state.view=b.dataset.view;render()}));
