@@ -1,0 +1,19 @@
+# SOLO TEST: il database e' effimero e puo' sparire a ogni restart/redeploy.
+services:
+  - type: web
+    name: handball-monitor-italia-test
+    runtime: python
+    region: frankfurt
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /healthz
+    envVars:
+      - key: APP_TIMEZONE
+        value: Europe/Rome
+      - key: SYNC_TIMES
+        value: 23:10,07:15
+      - key: SYNC_DAYS
+        value: "*"
+      - key: AUTO_SYNC_ON_EMPTY_DB
+        value: "1"
